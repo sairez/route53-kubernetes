@@ -158,21 +158,25 @@ func main() {
 					glog.Warningf("No zone found for %s", tld)
 					continue
 				}
-				// The AWS API may return more than one zone, the first zone should be the relevant one
-				tldWithDot := fmt.Sprint(tld, ".")
-				if *zones[0].Name != tldWithDot {
-					glog.Warningf("Zone found %s does not match tld given %s", *zones[0].Name, tld)
-					continue
-				}
-				zoneID := *zones[0].Id
-				zoneParts := strings.Split(zoneID, "/")
-				zoneID = zoneParts[len(zoneParts)-1]
+				// Loop through each zone returned
+				for z := range zones {
+					zone := zones[z]
 
-				if err = updateDNS(r53Api, hn, hzID, strings.TrimLeft(domain, "."), zoneID); err != nil {
-					glog.Warning(err)
-					continue
+					tldWithDot := fmt.Sprint(tld, ".")
+					if *zone.Name != tldWithDot {
+						glog.Warningf("Zone found %s does not match tld given %s", *zone.Name, tld)
+						continue
+					}
+					zoneID := *zone.Id
+					zoneParts := strings.Split(zoneID, "/")
+					zoneID = zoneParts[len(zoneParts)-1]
+
+					if err = updateDNS(r53Api, hn, hzID, strings.TrimLeft(domain, "."), zoneID); err != nil {
+						glog.Warning(err)
+						continue
+					}
+					glog.Infof("Created dns record set: tld=%s, subdomain=%s, zoneID=%s", tld, subdomain, zoneID)
 				}
-				glog.Infof("Created dns record set: tld=%s, subdomain=%s, zoneID=%s", tld, subdomain, zoneID)
 			}
 		}
 		time.Sleep(30 * time.Second)
