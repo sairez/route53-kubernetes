@@ -1,7 +1,7 @@
-GO=CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go
-TAG=v1.2.0
+GO=CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go 
+TAG=v1.0.1
 BIN=route53-kubernetes
-IMAGE=quay.io/molecule/$(BIN)
+IMAGE=docker.io/sairez/$(BIN)
 
 all: image
 	docker push $(IMAGE):$(TAG)
