@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -22,6 +23,30 @@ import (
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/labels"
 )
+
+// Don't actually commit the changes to route53 records, just print out what we would have done.
+var dryRun bool
+// Sleep time in secs before checking
+var sleepTime time.Duration
+
+func init() {
+	dryRunStr := os.Getenv("DRY_RUN")
+	if dryRunStr != "" {
+		dryRun = true
+	}
+
+	sleepTimeString := os.Getenv("SLEEP_TIME")
+	if (sleepTimeString != "") {
+		i64, err := strconv.ParseInt(sleepTimeString, 10, 32)
+		if (err != nil) {
+			fmt.Println("Error while trying to parse SLEEP_TIME env var")
+			os.Exit(1)
+		}
+		sleepTime = time.Duration(int32(i64))
+	} else {
+		sleepTime = 30
+	}
+}
 
 func main() {
 	flag.Parse()
@@ -104,7 +129,14 @@ func main() {
 	}
 
 	glog.Infof("Starting Service Polling every 30s")
+	awsCallFailed := false
 	for {
+		if awsCallFailed {
+			glog.Info("Noticed failed calls to AWS services, refreshing creds")
+			sess.Config.Credentials.Expire()
+			awsCallFailed = false
+		}
+
 		services, err := c.Services(api.NamespaceAll).List(listOptions)
 		if err != nil {
 			glog.Fatalf("Failed to list pods: %v", err)
@@ -115,7 +147,7 @@ func main() {
 			s := &services.Items[i]
 			hn, err := serviceHostname(s)
 			if err != nil {
-				glog.Warningf("Couldn't find hostname: %s", err)
+				glog.Warningf("Couldn't find hostname for %s: %s", s.Name, err)
 				continue
 			}
 
@@ -130,57 +162,93 @@ func main() {
 				domain := domains[j]
 
 				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, hn, domain)
-				domainParts := strings.Split(domain, ".")
-				segments := len(domainParts)
-				if segments < 3 {
-					glog.Warningf("Domain %s is invalid - it should be a fully qualified domain name and subdomain (i.e. test.example.com)", domain)
-					continue
-				}
-				tld := strings.Join(domainParts[segments-2:], ".")
-				subdomain := strings.Join(domainParts[:segments-2], ".")
-
-				hzID, err := hostedZoneID(elbAPI, hn)
+				elbZoneID, err := hostedZoneID(elbAPI, hn)
 				if err != nil {
 					glog.Warningf("Couldn't get zone ID: %s", err)
+					awsCallFailed = true
 					continue
 				}
 
-				listHostedZoneInput := route53.ListHostedZonesByNameInput{
-					DNSName: &tld,
-				}
-				hzOut, err := r53Api.ListHostedZonesByName(&listHostedZoneInput)
+				zone, err := getDestinationZone(domain, r53Api)
 				if err != nil {
-					glog.Warningf("No zone found for %s: %v", tld, err)
+					glog.Warningf("Couldn't find destination zone: %s", err)
+					awsCallFailed = true
 					continue
 				}
-				zones := hzOut.HostedZones
-				if len(zones) < 1 {
-					glog.Warningf("No zone found for %s", tld)
+
+				zoneID := *zone.Id
+				zoneParts := strings.Split(zoneID, "/")
+				zoneID = zoneParts[len(zoneParts)-1]
+
+				if err = updateDNS(r53Api, hn, elbZoneID, strings.TrimLeft(domain, "."), zoneID); err != nil {
+					glog.Warning(err)
+					awsCallFailed = true
 					continue
 				}
-				// Loop through each zone returned
-				for z := range zones {
-					zone := zones[z]
-
-					tldWithDot := fmt.Sprint(tld, ".")
-					if *zone.Name != tldWithDot {
-						glog.Warningf("Zone found %s does not match tld given %s", *zone.Name, tld)
-						continue
-					}
-					zoneID := *zone.Id
-					zoneParts := strings.Split(zoneID, "/")
-					zoneID = zoneParts[len(zoneParts)-1]
-
-					if err = updateDNS(r53Api, hn, hzID, strings.TrimLeft(domain, "."), zoneID); err != nil {
-						glog.Warning(err)
-						continue
-					}
-					glog.Infof("Created dns record set: tld=%s, subdomain=%s, zoneID=%s", tld, subdomain, zoneID)
-				}
+				glog.Infof("Created dns record set: domain=%s, zoneID=%s", domain, zoneID)
 			}
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(sleepTime * time.Second)
 	}
+}
+
+func getDestinationZone(domain string, r53Api *route53.Route53) (*route53.HostedZone, error) {
+	tld, err := getTLD(domain)
+	if err != nil {
+		return nil, err
+	}
+
+	listHostedZoneInput := route53.ListHostedZonesByNameInput{
+		DNSName: &tld,
+	}
+	hzOut, err := r53Api.ListHostedZonesByName(&listHostedZoneInput)
+	if err != nil {
+		return nil, fmt.Errorf("No zone found for %s: %v", tld, err)
+	}
+	// TODO: The AWS API may return multiple pages, we should parse them all
+
+	return findMostSpecificZoneForDomain(domain, hzOut.HostedZones)
+}
+
+func findMostSpecificZoneForDomain(domain string, zones []*route53.HostedZone) (*route53.HostedZone, error) {
+	domain = domainWithTrailingDot(domain)
+	if len(zones) < 1 {
+		return nil, fmt.Errorf("No zone found for %s", domain)
+	}
+	var mostSpecific *route53.HostedZone
+	curLen := 0
+
+	for i := range zones {
+		zone := zones[i]
+		zoneName := *zone.Name
+
+		if (domain == zoneName || strings.HasSuffix(domain, "." + zoneName)) && curLen < len(zoneName) {
+			curLen = len(zoneName)
+			mostSpecific = zone
+		}
+	}
+
+	if mostSpecific == nil {
+		return nil, fmt.Errorf("Zone found %s does not match domain given %s", *zones[0].Name, domain)
+	}
+
+	return mostSpecific, nil
+}
+
+func getTLD(domain string) (string, error) {
+	domainParts := strings.Split(domain, ".")
+	segments := len(domainParts)
+	if segments < 3 {
+		return "", fmt.Errorf("Domain %s is invalid - it should be a fully qualified domain name and subdomain (i.e. test.example.com)", domain)
+	}
+	return strings.Join(domainParts[segments-2:], "."), nil
+}
+
+func domainWithTrailingDot(withoutDot string) string {
+	if withoutDot[len(withoutDot)-1:] == "." {
+		return withoutDot
+	}
+	return fmt.Sprint(withoutDot, ".")
 }
 
 func serviceHostname(service *api.Service) (string, error) {
@@ -257,6 +325,11 @@ func updateDNS(r53Api *route53.Route53, hn, hzID, domain, zoneID string) error {
 		ChangeBatch:  &batch,
 		HostedZoneId: &zoneID,
 	}
+	if dryRun {
+		glog.Infof("DRY RUN: We normally would have updated %s to point to %s (%s)", zoneID, hzID, hn)
+		return nil
+	}
+
 	_, err := r53Api.ChangeResourceRecordSets(&crrsInput)
 	if err != nil {
 		return fmt.Errorf("Failed to update record set: %v", err)
